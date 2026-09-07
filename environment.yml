@@ -15,3 +15,6 @@ dependencies:
     - diffusers
     - gsplat
     - torchtyping
+    - kornia
+    - nerfstudio
+    
