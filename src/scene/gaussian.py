@@ -2,8 +2,8 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as Fn
 import numpy as np
+import math
 from inspect import signature
-
 from functools import cached_property
 from torchtyping import TensorType
 from typing import (Optional, Any, Tuple, List)
@@ -14,6 +14,10 @@ from warnings import warn
 from gsplat import rasterization
 import random as rd
 from kornia.geometry.conversions import quaternion_to_rotation_matrix
+from sklearn.neighbors import NearestNeighbors
+
+from plyfile import (PlyData, PlyElement)
+from tqdm import tqdm
 
 
 
@@ -33,7 +37,7 @@ class GsModelOutput:
                 self.covariences = self._covar()
 
     def _covar(self):
-        S = th.diag_embed(self.scales)
+        S = th.sqrt(th.diag_embed(self.scales))
         R = quaternion_to_rotation_matrix(self.rotations)
         M = (R @ S)
         return M @ M.transpose(-1, -2)
@@ -43,10 +47,25 @@ class GsModelOutput:
         for name, _ in signature(self.__init__)\
         .parameters.items():
             values = getattr(self, name)
+            # if name == "scales":
+                # values *= 1e+1
             attributes[name] = values.cpu().detach().numpy()
-            print(name, values.mean())
+            print(name, values.min(), values.mean(), values.max())
         return GsModelOutput(**attributes)
-        
+
+    def downsample(self, size: int=10):
+        attributes = {}
+        for name, _ in signature(self.__init__)\
+        .parameters.items():
+            values = getattr(self, name)
+            # if name == "scales":
+                # values *= 1e+1
+            attributes[name] = values[::size, :]
+        return GsModelOutput(**attributes)
+
+    def __len__(self) -> int:
+        return self.xyz.shape[0]
+
     
 
 
@@ -63,6 +82,10 @@ class GsSModelConfig:
     opacities_lr:               float=0.01
     scales_lr:                  float=0.04
     rotations_lr:               float=0.04
+    mlp_colors_lr:              float=0.01
+    mlp_opacities_lr:           float=0.01
+    mlp_scales_lr:              float=0.01
+    mlp_rotations_lr:            float=0.01
     opacity_trashold:           float=0.01
     densify_from:               int=1000
     density_every:              int=100
@@ -78,13 +101,21 @@ class GsSModelConfig:
     
 class GsModule(nn.Module):
     attributes: List[str] = ["feats", 
-                            "anchors",
+                            "anchors", 
                             "offsets", "opacities",
                             "colors", "scales", 
                             "rotations"]
     def __init__(self, config: GsSModelConfig):
         super(GsModule, self).__init__()
         self.config = config
+
+
+    def set_scale_bounds(self, min_b, max_b):
+        min_b = max(min_b, 1e-5)
+        self.scale_bounds = dict(min=min_b, 
+                                max=max_b,
+                                min_log=math.log(min_b),
+                                max_log=math.log(max_b))
 
     def _configure_heads(self):
         """Anchor features projection head 
@@ -96,18 +127,26 @@ class GsModule(nn.Module):
             dims = self.config.feat_dim + channels
             dims = (dims if not self.config.mlp_use_norms else dims + self.config.offsets_n)
             dims = (dims if not self.config.mlp_use_pca_projections else dims + self.config.offsets_n * 3)
-            print(dims)
             module = nn.Sequential(nn.Linear(dims, self.config.offsets_n*channels),
                                     (nn.Identity() if not normalize else nn.LayerNorm(self.config.offsets_n*channels)),
-                                    (nn.Identity() if head != "opacities" else nn.Sigmoid()))
+                                    (nn.Sigmoid() if head in ["opacities", "colors"] else nn.Identity()),
+                                    (nn.Softplus() if head == "scales" else nn.Identity()))
             setattr(self, f"_mlp_{head}", module)
 
     def _configure_optimizer(self):
         """Optimizer Configuration."""
-        self.optimizer = Adam(params=[{"params": getattr(self, f"_{attrib}"), 
-                        "name": attrib,
-                        "lr": getattr(self.config, f"{attrib}_lr")}
-                        for attrib in self.attributes])
+        self.optimizer = Adam(params=[
+            {"params": getattr(self, f"_{attrib}"), 
+            "name": attrib,
+            "lr": getattr(self.config, f"{attrib}_lr")}
+            for attrib in self.attributes
+        ] + [
+            {"params": getattr(self, f"_mlp_{attrib}").parameters(),
+            "name": f"mlp_{attrib}",
+            "lr": getattr(self.config, f"mlp_{attrib}_lr")}
+            for attrib in self.attributes
+            if attrib not in ["feats", "anchors", "offsets"]
+        ])
 
     
     def get_scene_diag(self, xyz):
@@ -118,46 +157,87 @@ class GsModule(nn.Module):
         diag = th.linalg.norm(max - min)
         return diag 
 
-    def get_scene_dist(self, xyz, chunk_portion: float=0.1, mode="min"):
-        """Calculates min/max distances betwen points 
-        in input PointCloud."""
-        assert mode in ["min", "max"]
-        optimal_dist = float("inf") if mode == "min" else float("-inf")
-        chunk_size = max(1, int((xyz.shape[0] * chunk_portion)))
-        chunks_n = int(xyz.shape[0] * chunk_portion)
-        for cidx in range(chunks_n):
-            chunk = xyz[cidx*chunk_size: (cidx + 1)*chunk_size, :]
-            diffs = chunk.view(-1, 1, 3) - chunk.view(1, -1, 3)
-            norms = th.linalg.norm(diffs, dim=-1)
-            norms = norms[norms != 0.0]
-            if norms.numel() != 0:
-                if mode == "min":
-                    min_norm = norms.min()
-                    if min_norm < optimal_dist: optimal_dist = min_norm
-                else:
-                    max_norm = norms.max()
-                    if max_norm > optimal_dist: optimal_dist = max_norm
+    def get_scene_dists(self, xyz, 
+                            chunk_portion: float=0.1, 
+                            mode="min", 
+                            k: int=5,
+                            return_tensors: str="pt",
+                            min_n: int=10000):
 
-        return optimal_dist
+
+            #TODO add outlier removal to avoid numerical instabbilities
+            _modes = dict(min=1, max=-1)
+            assert mode in _modes
+            n = xyz.shape[0]
+            xyz = xyz                               \
+                    if isinstance(xyz, np.ndarray)  \
+                    else xyz.detach().cpu().numpy()
+            chunk_size = max(1, int((n * chunk_portion)))
+            chunks_n = int(n // chunk_size)
+            (min_dist, max_dist) = (float("inf"), float("-inf"))
+            def _handle_chunk(xyz_chunk, min_d, max_d):
+                nn_search = NearestNeighbors(n_neighbors=k)
+                nn_search.fit(xyz_chunk)
+                distances, indices = nn_search.kneighbors(xyz_chunk)
+                indices = indices[:, _modes[mode]]
+                xyz_closest = xyz_chunk[indices]
+
+                dist = xyz_chunk - xyz_closest
+                ani_dist = np.abs(dist)
+                euclid_dist = np.linalg.norm(dist, axis=-1)
+                min_d = min(min_d, distances[:, _modes[mode]].min())
+                max_d = max(max_d, distances[:, _modes[mode]].max())
+                return dict(ani_dists=ani_dist,
+                            euclid_dists=euclid_dist,
+                            min_d=min_d, max_d=max_d)
+
+            results = dict(ani_dists=[], euclid_dists=[])
+            def _manage_chunk(sidx: int, e_idx: int, min_d: float, max_d: float):
+                xyz_chunk = xyz[sidx: e_idx, :]
+                chunk_dists = _handle_chunk(xyz_chunk, min_dist, max_dist)
+                for name in results.keys():
+                    results[name].append(chunk_dists[name])
+                min_d = chunk_dists["min_d"]
+                max_d = chunk_dists["max_d"]
+                return (min_d, max_d)
+
+            if n > min_n:
+                for cidx in tqdm(range(chunks_n), desc="reading scene meter..."):
+                    (min_dist, max_dist) =  _manage_chunk(cidx*chunk_size, (cidx + 1)*chunk_size, min_dist, max_dist)
+                if (chunks_n*chunk_size) < n:
+                    (min_dist, max_dist) = _manage_chunk(chunks_n*chunk_size, n, min_dist, max_dist)
+            else:
+                (min_dist, max_dist) = _manage_chunk(0, n, min_dist, max_dist)
+
+            for (name, value) in results.items():
+                value = np.concatenate(value)
+                if return_tensors == "pt":
+                    value = th.from_numpy(value).float()
+                results[name] = value
+            results.update({"min_dist": min_dist, "max_dist": max_dist})
+            return results
     
     def setup_model(self, xyz: TensorType["N", "xyz"],
                         rgb: TensorType["N", "rgb"]):
         """Model initialization function. """
         n = xyz.shape[0]
-        min_dist = self.get_scene_dist(xyz, mode="min")
-        print(min_dist)
+        dists = self.get_scene_dists(xyz, mode="min", return_tensors="pt")
+        self.set_scale_bounds(dists["min_dist"], dists["max_dist"])
         self.scene_scale = self.get_scene_diag(xyz)
+        print(self.scale_bounds)
 
         self._feats = nn.Parameter(th.zeros(n, self.config.feat_dim))
         self._anchors = nn.Parameter(xyz)
         self._offsets = nn.Parameter(th.zeros(n, self.config.offsets_n, 3))
-        self._scales = nn.Parameter(th.ones(n, 3) * th.log(min_dist + 1e-5))
-        self._rotations = nn.Parameter(th.zeros(n, 4))
+        # self._scales = nn.Parameter(th.ones(n, 3) * th.log(min_dist + 1e-5))
+        print(dists["ani_dists"][5], th.log(dists["ani_dists"])[5], th.exp(th.log(dists["ani_dists"]))[0])
+        self._scales = nn.Parameter(th.log(dists["ani_dists"] + 1e-2))
+        self._rotations = nn.Parameter(th.normal(0, 1, (n, 4)))
         self._colors = nn.Parameter(rgb)
         self._opacities = nn.Parameter(th.zeros(n, 1))
         
-        self._configure_optimizer()
         self._configure_heads()
+        self._configure_optimizer()
 
     def generate_splats(self):
         """Neural Gaussian Generation function with PCA projection. 
@@ -191,17 +271,28 @@ class GsModule(nn.Module):
             dirs_feats = (dirs_feats if dirs_feats is not None else features)
             dirs_feats = th.cat([dirs_feats, features_pca], dim=-1)
 
+        def _builds_features(name, feats, dirs_feats=None):
+            if dirs_feats is None:
+                return th.cat([feats, 
+                                getattr(self, f"_{name}")], 
+                                dim=-1)
+            else:
+                return th.cat([feats, 
+                                getattr(self, f"_{name}"),
+                                dirs_feats], dim=-1)
+            
         project_features = lambda name: \
-            getattr(self, f"_mlp_{name}")(th.cat([features, getattr(self, f"_{name}")], dim=-1) 
-                                        if dirs_feats is None 
-                                        else th.cat([features, getattr(self, f"_{name}"), dirs_feats])).view(-1, 3)
-        attributes = {"xyz": xyz.view(-1, 3)}
-        attributes.update({name: project_features(name).view(-1, channels)
-                            for (name, channels) in [("colors", 3), 
-                                                    ("opacities", 1), 
-                                                    ("scales", 3), 
-                                                    ("rotations", 4)]})
-        attributes["scales"] = th.exp(attributes["scales"])
+                        getattr(self, f"_mlp_{name}")(_builds_features(name, features, dirs_feats))
+        attributes = dict(xyz=xyz.view(-1, 3), **{
+            name: project_features(name).view(-1, channels)
+            for (name, channels) in [("colors",     3), 
+                                    ("opacities",   1), 
+                                    ("scales",      3),
+                                    ("rotations",   4)]
+        })
+        attributes["scales"] = th.exp(th.clamp(attributes["scales"], 
+                                                min=self.scale_bounds["min_log"],
+                                                max=self.scale_bounds["max_log"]))
         return GsModelOutput(**attributes)
 
     def __len__(self):
@@ -329,27 +420,3 @@ class AnchorGrowing:
                 omask = (self._opacity_accumulator 
                         < self.config.opacity_trashold).squeeze()
                 self.remove_from_optimizer(omask)
-        
-
-if __name__ == "__main__":
-
-    from viser import ViserServer
-    # from viser4d import Viser4dServer
-    from ..data.datasets.mip_nerf import MipNErf360Dataset
-
-    path = "/run/media/ramzan/T7/datasets/neuiral_rendering/360_v2"
-    dataset = MipNErf360Dataset(path, scene="kitchen")
-
-    config = GsSModelConfig()
-    pc = GsModule(config)
-    pc.setup_model(**dataset.sparse)
-
-    gs = pc.generate_splats().to_numpy()
-    server = ViserServer()
-    server.scene.add_gaussian_splats(name="gs", centers=gs.xyz,
-                                    covariances=gs.covariences,
-                                    rgbs=gs.colors,
-                                    opacities=gs.opacities)
-    import time 
-    while True:
-        time.sleep(10)
