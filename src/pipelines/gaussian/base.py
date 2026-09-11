@@ -25,15 +25,14 @@ from ...scene.gaussian import (GsModule,
 #           5) Camera params optimization [extrinsics/intrinsics]
 
 @dataclass
-class BaseGsOPiepelineConfig:
-    learn_extrinsics: bool=True
+class Base3DReconstructionPiepelineConfig:
     gs_model: GsSModelConfig=field(default=GsSModelConfig)
     criterion: CombinedVisualLossConfig=field(default=CombinedVisualLossConfig)
 
-class BaseGsPipeline(l.LightningModule):
+class Base3DReconstructionPiepeline(l.LightningModule):
     def __init__(self, config: GsSModelConfig, 
                 criterion_config: CombinedVisualLossConfig):
-        super(BaseGsPipeline, self).__init__()
+        super(Base3DReconstructionPiepeline, self).__init__()
         self.config = config
         self.pc = GsModule(config)
         self.stratagy = AnchorGrowing(self.pc, config)
@@ -99,7 +98,11 @@ class BaseGsPipeline(l.LightningModule):
     def validation_step(self, batch, batch_idx):
         return self._step(batch, batch_idx, mode="val")
 
-    def write_ply(self, path: str, mode: str="anchor"):
+    def write_ply(self, path: str, 
+                        gs: Optional[GsModelOutput]=None, 
+                        mode: str="anchor"):
+        """Writes gaussian splatting file from input gs: GsModuleOutput 
+        or from egneration from current state pc module in pipeline. """
         correct_naming = dict(feats="feats",
                             rotations="rot", 
                             scales="scale", 
@@ -124,9 +127,9 @@ class BaseGsPipeline(l.LightningModule):
                 attribues[name] = values[name]
             return attribues 
         
-        def _default_gs_attribues():
+        def _default_gs_attribues(gs=None):
             (values, dtypes) = [], []
-            gs = self.pc.generate_splats().to_numpy()
+            gs = gs if gs is not None else self.pc.generate_splats().to_numpy()
             for name in fields(gs):
                 value = getattr(gs, name)
                 dtype = list(f"{correct_naming[name]}_{idx}" 
@@ -141,21 +144,10 @@ class BaseGsPipeline(l.LightningModule):
                 attribues[name] = values[name]
             return attribues 
 
+        if gs is not None: mode = "default"
         attribs_fns = dict(anchor=_anchor_attributes, 
                             default=_default_gs_attribues)
-        attribues = attribs_fns[mode]()
+        attribues = attribs_fns[mode](gs)
         elements = PlyElement.describe(attribues)
         PlyData([elements]).write(path)
 
-
-
-if __name__ == "__main__":
-    config = GsSModelConfig()
-    pc = GsModule(config)
-    # xyz = np.random.normal(0, 1, (100, 3))
-    # rgb = np.random.normal(0, 1, (100, 3))
-    xyz = th.normal(0, 1, (100, 3))
-    rgb = th.normal(0, 1, (100, 3))
-    pc.setup_model(xyz, rgb)
-    print(pc)
-    

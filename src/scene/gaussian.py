@@ -85,7 +85,7 @@ class GsSModelConfig:
     mlp_colors_lr:              float=0.01
     mlp_opacities_lr:           float=0.01
     mlp_scales_lr:              float=0.01
-    mlp_rotations_lr:            float=0.01
+    mlp_rotations_lr:           float=0.01
     opacity_trashold:           float=0.01
     densify_from:               int=1000
     density_every:              int=100
@@ -96,8 +96,6 @@ class GsSModelConfig:
     optimizer_type:             str="adam"
     near_plane:                 float=1e-2
     far_plane:                  float=1e10
-    
-    
     
 class GsModule(nn.Module):
     attributes: List[str] = ["feats", 

@@ -2,6 +2,7 @@ import torch as th
 import os
 import random as rd
 import numpy as np
+from dataclasses import (dataclass, field)
 from tqdm import tqdm
 from functools import cached_property
 from PIL import Image
@@ -12,43 +13,47 @@ from torch.utils.data import Dataset
 from nerfstudio.data.utils.colmap_parsing_utils import (read_cameras_binary,
                                                         read_points3D_binary,
                                                         read_images_binary)
+from .registry import register_dataset
 
 
 
-class MipNErf360Dataset(Dataset):
+@dataclass
+class MipNerf360v2DatasetConfig:
+    name: str=field(default="360v2", repr=False, compare=False)
+    path: str
+    scene: Literal["bicycle", 
+                    "bonsai",
+                    "counter",
+                    "garden",
+                    "kitchen",
+                    "room",
+                    "stump"]="garden"
+    resolution_type: int=0
+    max_views: Optional[int]=None
+    random_views: bool=False
+
+@register_dataset("360v2", MipNerf360v2DatasetConfig)
+class MipNerf360v2Dataset(Dataset):
     _res_factors = [1, 2, 4, 8]
-    def __init__(self, path: str,
-                scene: Literal["bicycle", 
-                                "bonsai",
-                                "counter",
-                                "garden",
-                                "kitchen",
-                                "room",
-                                "stump"]="garden",
-                resolution_type: int=0,
-                max_views: Optional[int]=None,
-                random_views: bool=False):
-        super(MipNErf360Dataset, self).__init__()
-        content = list(os.listdir(path))
-        self.path = os.path.join(path, scene)
-        assert (scene in content), \
-        (f"there is not such {scene=} in data folder.")
+    def __init__(self, config: MipNerf360v2DatasetConfig):
+        super(MipNerf360v2Dataset, self).__init__()
+        self.config = config
+        content = list(os.listdir(config.path))
+        self.path = os.path.join(config.path, config.scene)
+        assert (config.scene in content), \
+        (f"there is not such {config.scene=} in data folder.")
         content = list(os.listdir(self.path))
         assert ("sparse" in content), \
         (f"coudn't find sparse data at location: {self.path}. \n"
             "Mip_Nerf360v2 dataest have restricted data format \n"
             "that can figure at the link: https://jonbarron.info/mipnerf360/ \n")
 
-        self._rt = resolution_type
-        self.max_views = max_views
-        self.random_views = random_views
-        self.transform: callable = None
-        
         images_folders = list(f for f in os.listdir(self.path) if "images" in f)
-        assert resolution_type < len(images_folders)
-        self.images_folder = os.path.join(self.path, images_folders[self._rt])
+        assert config.resolution_type < len(images_folders)
+        self.images_folder = os.path.join(self.path, images_folders[self.config.resolution_type])
         self.sparse_data = os.path.join(self.path, "sparse")
 
+        self.transform: callable = None
         self._read_data()
 
     @property
@@ -60,8 +65,8 @@ class MipNErf360Dataset(Dataset):
         self.transform = transform
 
     def _get_factor(self, size: tuple):
-        new_size = (size[0] / self._res_factors[self._rt], 
-                    size[1] / self._res_factors[self._rt])
+        new_size = (size[0] / self._res_factors[self.config.resolution_type], 
+                    size[1] / self._res_factors[self.config.resolution_type])
         return {"sx": new_size[0] / size[0], 
                 "sy": new_size[1] / size[1]}
 
@@ -82,12 +87,12 @@ class MipNErf360Dataset(Dataset):
         self.intrinsics: Dict[int, Any] = read_cameras_binary(os.path.join(self.sparse_data, "0/cameras.bin"))
         images_info: Dict[int, Any] = read_images_binary(os.path.join(self.sparse_data, "0/images.bin"))
 
-        max_views = min(self.max_views, len(images_info))   \
-                        if self.max_views is not None       \
+        max_views = min(self.config.max_views, len(images_info))   \
+                        if self.config.max_views is not None       \
                         else len(images_info)
         view_indices = list(images_info.keys())
         view_indices = rd.sample(view_indices, max_views)   \
-                        if self.random_views                \
+                        if self.config.random_views                \
                         else view_indices[:max_views]
 
         self.samples = []

@@ -22,7 +22,8 @@ def log_views(origin: str, viewmats, Ks, images=None, cs=None):
         image = None                \
                 if images is None   \
                 else images[idx, ...]
-        log_single_view(f"{origin}/frame-{idx}", image=image,
+        log_single_view(f"{origin}/frame-{idx}", 
+                        image=image,
                         K=Ks[idx, ...],
                         viewmat=viewmats[idx, ...])
 
