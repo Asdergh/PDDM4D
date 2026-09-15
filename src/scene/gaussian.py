@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as Fn
 import numpy as np
 import math
+import os
+
 from inspect import signature
 from functools import cached_property
 from torchtyping import TensorType
@@ -18,7 +20,7 @@ from sklearn.neighbors import NearestNeighbors
 
 from plyfile import (PlyData, PlyElement)
 from tqdm import tqdm
-
+import logging
 
 
 @dataclass
@@ -28,13 +30,13 @@ class GsModelOutput:
     colors:         Optional[th.Tensor | np.ndarray]=None
     rotations:      Optional[th.Tensor | np.ndarray]=None
     scales:         Optional[th.Tensor | np.ndarray]=None
-    covariences:    Optional[th.Tensor | np.ndarray]=None
+    covariances:    Optional[th.Tensor | np.ndarray]=None
 
     def __post_init__(self):
-        if self.covariences is None:
+        if self.covariances is None:
             if (self.scales is not None) \
             and (self.rotations is not None):
-                self.covariences = self._covar()
+                self.covariances = self._covar()
 
     def _covar(self):
         S = th.sqrt(th.diag_embed(self.scales))
@@ -66,11 +68,9 @@ class GsModelOutput:
     def __len__(self) -> int:
         return self.xyz.shape[0]
 
-    
-
 
 @dataclass
-class GsSModelConfig:
+class GsModelConfig:
     feat_dim:                   int=32
     offsets_n:                  int=6
     mlp_use_norms:              bool=False
@@ -87,7 +87,7 @@ class GsSModelConfig:
     mlp_scales_lr:              float=0.01
     mlp_rotations_lr:           float=0.01
     opacity_trashold:           float=0.01
-    densify_from:               int=1000
+    densify_from:               int=100
     density_every:              int=100
     densify_until:              int=3000
     opacity_trashold:           float=0.01
@@ -96,25 +96,34 @@ class GsSModelConfig:
     optimizer_type:             str="adam"
     near_plane:                 float=1e-2
     far_plane:                  float=1e10
+    device:                     str="cuda"
+    raster_width:               int=224
+    raster_height:              int=224
+
     
 class GsModule(nn.Module):
     attributes: List[str] = ["feats", 
                             "anchors", 
                             "offsets", "opacities",
-                            "colors", "scales", 
+                            "colors", "scales",
                             "rotations"]
-    def __init__(self, config: GsSModelConfig):
+    def __init__(self, config: GsModelConfig=None, device: str="cuda"):
         super(GsModule, self).__init__()
-        self.config = config
+        self.cfg = config
+        if self.cfg is None:
+            self.cfg = GsModelConfig()
+        self.device = device
 
+    def set_scale_bounds(self, a, b):
+        a = max(a, 1e-5)
+        self.scale_bounds = dict(min=a, max=b,
+                                min_log=math.log(a),
+                                max_log=math.log(b))
 
-    def set_scale_bounds(self, min_b, max_b):
-        min_b = max(min_b, 1e-5)
-        self.scale_bounds = dict(min=min_b, 
-                                max=max_b,
-                                min_log=math.log(min_b),
-                                max_log=math.log(max_b))
-
+    def _make_learnable(self, x: th.Tensor):
+        """convert simple th.Tensor into learnable param"""
+        return nn.Parameter(x.to(self.device).requires_grad_(True))
+    
     def _configure_heads(self):
         """Anchor features projection head 
         initialization function."""
@@ -122,13 +131,13 @@ class GsModule(nn.Module):
                                             ("opacities",   1, True), 
                                             ("colors",      3, True), 
                                             ("rotations",   4, False)):
-            dims = self.config.feat_dim + channels
-            dims = (dims if not self.config.mlp_use_norms else dims + self.config.offsets_n)
-            dims = (dims if not self.config.mlp_use_pca_projections else dims + self.config.offsets_n * 3)
-            module = nn.Sequential(nn.Linear(dims, self.config.offsets_n*channels),
-                                    (nn.Identity() if not normalize else nn.LayerNorm(self.config.offsets_n*channels)),
+            dims = self.cfg.feat_dim + channels
+            dims = (dims if not self.cfg.mlp_use_norms else dims + self.cfg.offsets_n)
+            dims = (dims if not self.cfg.mlp_use_pca_projections else dims + self.cfg.offsets_n * 3)
+            module = nn.Sequential(nn.Linear(dims, self.cfg.offsets_n*channels),
+                                    (nn.Identity() if not normalize else nn.LayerNorm(self.cfg.offsets_n*channels)),
                                     (nn.Sigmoid() if head in ["opacities", "colors"] else nn.Identity()),
-                                    (nn.Softplus() if head == "scales" else nn.Identity()))
+                                    (nn.Softplus() if head == "scales" else nn.Identity())).to(self.device)
             setattr(self, f"_mlp_{head}", module)
 
     def _configure_optimizer(self):
@@ -136,17 +145,16 @@ class GsModule(nn.Module):
         self.optimizer = Adam(params=[
             {"params": getattr(self, f"_{attrib}"), 
             "name": attrib,
-            "lr": getattr(self.config, f"{attrib}_lr")}
+            "lr": getattr(self.cfg, f"{attrib}_lr")}
             for attrib in self.attributes
         ] + [
             {"params": getattr(self, f"_mlp_{attrib}").parameters(),
             "name": f"mlp_{attrib}",
-            "lr": getattr(self.config, f"mlp_{attrib}_lr")}
+            "lr": getattr(self.cfg, f"mlp_{attrib}_lr")}
             for attrib in self.attributes
             if attrib not in ["feats", "anchors", "offsets"]
         ])
 
-    
     def get_scene_diag(self, xyz):
         """Calculates the diagonal of 
         input PointCloud bounding box."""
@@ -161,7 +169,6 @@ class GsModule(nn.Module):
                             k: int=5,
                             return_tensors: str="pt",
                             min_n: int=10000):
-
 
             #TODO add outlier removal to avoid numerical instabbilities
             _modes = dict(min=1, max=-1)
@@ -214,8 +221,8 @@ class GsModule(nn.Module):
                 results[name] = value
             results.update({"min_dist": min_dist, "max_dist": max_dist})
             return results
-    
-    def setup_model(self, xyz: TensorType["N", "xyz"],
+
+    def setup_from_pts(self, xyz: TensorType["N", "xyz"],
                         rgb: TensorType["N", "rgb"]):
         """Model initialization function. """
         n = xyz.shape[0]
@@ -223,16 +230,14 @@ class GsModule(nn.Module):
         self.set_scale_bounds(dists["min_dist"], dists["max_dist"])
         self.scene_scale = self.get_scene_diag(xyz)
         print(self.scale_bounds)
-
-        self._feats = nn.Parameter(th.zeros(n, self.config.feat_dim))
-        self._anchors = nn.Parameter(xyz)
-        self._offsets = nn.Parameter(th.zeros(n, self.config.offsets_n, 3))
-        # self._scales = nn.Parameter(th.ones(n, 3) * th.log(min_dist + 1e-5))
-        print(dists["ani_dists"][5], th.log(dists["ani_dists"])[5], th.exp(th.log(dists["ani_dists"]))[0])
-        self._scales = nn.Parameter(th.log(dists["ani_dists"] + 1e-2))
-        self._rotations = nn.Parameter(th.normal(0, 1, (n, 4)))
-        self._colors = nn.Parameter(rgb)
-        self._opacities = nn.Parameter(th.zeros(n, 1))
+        
+        self._feats = self._make_learnable(th.zeros(n, self.cfg.feat_dim))
+        self._anchors = self._make_learnable(xyz)
+        self._offsets = self._make_learnable(th.zeros(n, self.cfg.offsets_n, 3))
+        self._scales = self._make_learnable(th.log(dists["ani_dists"] + 1e-2))
+        self._rotations = self._make_learnable(th.normal(0, 1, (n, 4)))
+        self._colors = self._make_learnable(rgb)
+        self._opacities = self._make_learnable(th.zeros(n, 1))
         
         self._configure_heads()
         self._configure_optimizer()
@@ -257,9 +262,9 @@ class GsModule(nn.Module):
         dirs = (dirs / th.linalg.norm(dirs, dim=-1, keepdims=True))
 
         dirs_feats = None
-        if self.config.mlp_use_norms:
+        if self.cfg.mlp_use_norms:
             dirs_feats = th.linalg.norm(dirs, dim=-1)
-        if self.config.mlp_use_pca_projections:
+        if self.cfg.mlp_use_pca_projections:
             ipca = IncrementalPCA(n_components=3,
                                     batch_size=256,
                                     device=features.device)
@@ -293,14 +298,108 @@ class GsModule(nn.Module):
                                                 max=self.scale_bounds["max_log"]))
         return GsModelOutput(**attributes)
 
+    def read_ply(self, path: str):
+        """Anchor Gs format ply file reader"""
+        if os.path.exists(path):
+            data = PlyData.read(path)["vertex"]
+            for attrib in self.attributes:
+                values = list(data[p.name] 
+                        for p in data.properties 
+                        if attrib in p.name)
+                if isinstance(values[0], np.ndarray):
+                    values = np.stack(values, axis=-1)
+                    values = th.from_numpy(values).float()
+                elif isinstance(values[0], th.Tensor):
+                    values = th.stack(values, dim=-1)
+                else:
+                    raise ValueError(f"unknow type for {attrib}: {type(values[0])}")
+                if attrib == "offsets":
+                    values = values.view(-1, self.cfg.offsets_n, 3)
+                setattr(self, f"_{attrib}", self._make_learnable(values))
+
+            scale_params = self.get_scene_dists(self._anchors)
+            self.set_scale_bounds(a=scale_params["min_dist"], 
+                                    b=scale_params["max_dist"])
+            self._configure_heads()
+            self._configure_optimizer()
+
+    def write_ply(self, path: str):
+        """Anchor Gs format ply file writer"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        elements = dict()
+        for attrib in self.attributes:
+            if attrib != "offsets":
+                values = getattr(self, f"_{attrib}")
+                types = list((f"{attrib}_{i}", "f4") for i in range(values.shape[-1]))
+                values = values.unbind(dim=1)
+            else:
+                values = getattr(self, f"_{attrib}")
+                types = list((f"{attrib}_{i}_{j}", "f4")
+                                for i in range(values.shape[1])
+                                for j in range(values.shape[-1]))
+                values = values.view(-1, 3*self.cfg.offsets_n).unbind(dim=-1)
+            elements.update(dict(zip(types, values)))
+
+        e = np.empty((self._anchors.shape[0],), dtype=list(elements.keys()))
+        for (key, values) in elements.items():
+            e[key[0]] = values.detach().cpu().numpy()
+        e = PlyElement.describe(e, "vertex")
+        PlyData([e], text=True).write(path)
+
+
+    @classmethod
+    def load_from_checkpoint(cfg, path: str) -> 'GsModule':
+        """initialize model from single checkpoint"""
+        if os.path.exists(path):
+            ckpt = th.load(path)
+            cfg = GsModelConfig(**ckpt["hyperparams"])
+            pc = GsModule(cfg, device="cpu")
+
+            pc.read_ply(ckpt["sparse_states"])
+            pc.load_state_dict(ckpt["gaussian_heads"])
+            pc.optimizer.load_state_dict(ckpt["optimizer_states"])
+            return pc
+
     def __len__(self):
         if hasattr(self, "_anchors"): return self._anchors.shape[0]
         else: warn("Gs module is not initilized")
 
+    def forward(self, 
+            extrinsics: TensorType["C", "4", "4"],
+            intrinsics: TensorType["C", "3", "3"],
+            far_near: Tuple[float]=(1e-2, 1e10),
+            features: Optional[TensorType["N", "d"]]=None,
+            gs: Optional[GsModelOutput]=None,
+            scale_modifier: float=1.0):
+
+        gs = gs if gs is not None else self.generate_splats()
+        features = gs.colors if features is None else features
+        (render_rgb, render_alpha, meta) = rasterization(
+            means=gs.xyz,
+            quats=gs.rotations,
+            scales=gs.scales * scale_modifier,
+            opacities=gs.opacities.squeeze(),
+            colors=gs.colors,
+            viewmats=extrinsics,
+            Ks=intrinsics,
+            near_plane=far_near[0],
+            far_plane=far_near[1],
+            width=self.cfg.raster_width,
+            height=self.cfg.raster_height,
+            
+        )
+        return dict(rgb=render_rgb.permute(0, 3, 1, 2),
+                    alpha=render_alpha.permute(0, 3, 1, 2),
+                    meta=meta)
+    
 class AnchorGrowing:
-    def __init__(self, pc: GsModule, config: GsSModelConfig):
+    def __init__(self, 
+                pc: GsModule, 
+                config: GsModelConfig, 
+                logger: Optional[logging.Logger]=None):
         self.pc = pc
-        self.config = config
+        self.cfg = config
+        self.logger = logger
         self._opacity_accumulator = None
         self._gradient_accumulator = None
 
@@ -319,7 +418,7 @@ class AnchorGrowing:
             values = values[~mask]
             setattr(self.pc, f"_{name}", values)
         self._opacity_accumulator = self._opacity_accumulator[~mask]
-        gaccum = self._gradient_accumulator.view(-1, self.config.offsets_n)
+        gaccum = self._gradient_accumulator.view(-1, self.cfg.offsets_n)
         gaccum = gaccum[~mask]
         self._gradient_accumulator = gaccum
     
@@ -391,19 +490,21 @@ class AnchorGrowing:
                     opacities: TensorType["N", "1"]):
 
         xyz_grads = th.linalg.norm(xyz_full.grad, dim=-1)
-        distances = th.linalg.norm(xyz_full.view(-1, self.config.offsets_n, 3) \
+        distances = th.linalg.norm(xyz_full.view(-1, self.cfg.offsets_n, 3) \
                         - self.pc._anchors.view(-1, 1, 3), dim=-1).view(-1)
-        distances_mask = (distances > self.config.anchor_distance_trashold)
-        opacities = opacities.view(-1, self.config.offsets_n).mean(dim=-1)
+        distances_mask = (distances > self.cfg.anchor_distance_trashold)
+        opacities = opacities.view(-1, self.cfg.offsets_n).mean(dim=-1)
         self.update(xyz_grads, opacities)
-        if step_idx > self.config.densify_from:
-            if (step_idx <= self.config.densify_until) \
-                and (step_idx % self.config.densify_every) == 0:
+        if step_idx > self.cfg.densify_from:
+            if (step_idx <= self.cfg.densify_until) \
+                and (step_idx % self.cfg.densify_every) == 0:
 
-                grow_mask = (self._gradient_accumulator > self.config.xyz_gradient_trashold)
+                if self.logger is not None:
+                    self.logger.info(f"Points before densification: {self.pc._anchors.shape[0]}")
+                grow_mask = (self._gradient_accumulator > self.cfg.xyz_gradient_trashold)
                 grow_indices = th.where(distances_mask & grow_mask)[0]
                 anchor_indices = grow_indices % len(self.pc)
-                grow_indices = th.cat([grow_indices[anchor_indices == idx][rd.randint(0, self.config.offsets_n - 1)]
+                grow_indices = th.cat([grow_indices[anchor_indices == idx][rd.randint(0, self.cfg.offsets_n - 1)]
                                     for idx in th.unique(anchor_indices)], 
                                     dim=0)
                 
@@ -416,5 +517,9 @@ class AnchorGrowing:
                 self.grow_optimizer(xyz, anchor_mask)
 
                 omask = (self._opacity_accumulator 
-                        < self.config.opacity_trashold).squeeze()
+                        < self.cfg.opacity_trashold).squeeze()
                 self.remove_from_optimizer(omask)
+                self._opacity_accumulator *= 0
+                self._gradient_accumulator *= 0
+                if self.logg is not None:
+                    self.logger.info(f"Points after densification: {self.pc._anchors.shape[0]}")

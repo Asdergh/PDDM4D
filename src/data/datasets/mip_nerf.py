@@ -19,8 +19,8 @@ from .registry import register_dataset
 
 @dataclass
 class MipNerf360v2DatasetConfig:
-    name: str=field(default="360v2", repr=False, compare=False)
     path: str
+    name: str=field(default="360v2", repr=False, compare=False)
     scene: Literal["bicycle", 
                     "bonsai",
                     "counter",
@@ -91,7 +91,7 @@ class MipNerf360v2Dataset(Dataset):
                         if self.config.max_views is not None       \
                         else len(images_info)
         view_indices = list(images_info.keys())
-        view_indices = rd.sample(view_indices, max_views)   \
+        view_indices = rd.sample(view_indices, max_views)          \
                         if self.config.random_views                \
                         else view_indices[:max_views]
 
@@ -133,11 +133,9 @@ class MipNerf360v2Dataset(Dataset):
     def __getitem__(self, idx: int):
         if idx >= len(self):
             raise IndexError(f"{idx=} is out range for dataset lenght")
-        meta = self.samples[idx]
-        image = to_tensor(Image.open(meta["image"]))
+        image = to_tensor(Image.open(self.samples[idx]["image"]))
         image = image                       \
                 if self.transform is None   \
                 else self.transform(image)
-        meta["image"] = image
-        return meta
+        return {**self.samples[idx], "image": image}
 

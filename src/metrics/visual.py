@@ -195,15 +195,12 @@ class CombinedVisualLoss(nn.Module):
         return {'dssim': dssim_norm,
                 'l2': l2_norm,
                 'perceptual': perceptual_norm,
-                'total': total,
-                'weights': weights.detach()}
+                'total': total}
 
     def get_difference_maps(self, pred: torch.Tensor, gt: torch.Tensor) -> Dict[str, torch.Tensor]:
         ssim_map = self._ssim_map(pred, gt)
         dssim_map = 1 - ssim_map
-
         l2_map = (pred - gt).pow(2).mean(dim=1, keepdim=True)
-
         pred_norm = (pred - self.perceptual_mean.to(pred.device)) / self.perceptual_std.to(pred.device)
         gt_norm = (gt - self.perceptual_mean.to(gt.device)) / self.perceptual_std.to(gt.device)
 
