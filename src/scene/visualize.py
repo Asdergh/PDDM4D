@@ -521,7 +521,7 @@ class GaussianSplatVisualizer:
         if hi - lo < 1e-9:
             hi = lo + 1.0
         depth01 = np.clip((distances - lo) / (hi - lo), 0.0, 1.0)
-        return self._apply_colormap(depth01, self.cmap)
+        return self._apply_colormap(depth01, self._cmap)
 
     def _normal_vectors(self) -> np.ndarray:
         """Unit normals of the Gaussians -- the direction of the ellipsoid's smallest radius.
@@ -599,7 +599,7 @@ class GaussianSplatVisualizer:
         cosine_map = np.einsum("njk,nk->nj", direction, normals)  # (N,M) in [-1,1]
         combined = self._combine_cosine_maps(cosine_map, dist[..., 0])
         angular = np.arccos(np.clip(combined, -1.0, 1.0)) / np.pi  # [0,1]
-        return self._apply_colormap(angular, self.cmap)
+        return self._apply_colormap(angular, self._cmap)
 
     @staticmethod
     def _apply_colormap(values01: np.ndarray, cmap: str="turbo") -> np.ndarray:

@@ -158,10 +158,16 @@ def train3D(cfg: Training3DConfig):
     pc.setup_from_pts(**loader.dataset.sparse)
     densifier = AnchorGrowing(pc, cfg.gaussian_config, logger=logger)
     try:
-        for epoch in tqdm(range(cfg.epochs), desc="3D Training...", colour="green"):
-            for batch_idx, batch in tqdm(enumerate(loader),
-                                        desc="Batch processing ...",
-                                        colour="blue"):
+        for epoch in tqdm(
+            range(cfg.epochs), 
+            desc="3D Training...", 
+            colour="green"
+        ):
+            for batch_idx, batch in tqdm(
+                enumerate(loader),
+                desc="Batch processing ...",
+                colour="blue"
+            ):
                 global_step = (epoch * len(loader)) + batch_idx
                 (images, Twc, K) = (
                     batch["image"].to(cfg.gaussian_config.device),
@@ -172,6 +178,12 @@ def train3D(cfg: Training3DConfig):
                 neural_gs = pc.generate_splats()
                 neural_gs.xyz.retain_grad()
                 render_pkg = pc(Twc, K, gs=neural_gs, scale_modifier=1e-2)
+                print(render_pkg["rgb"].min(), render_pkg["rgb"].mean(), render_pkg["rgb"].max())
+                import matplotlib.pyplot as plt
+                _, axis = plt.subplots()
+                axis.imshow(render_pkg["rgb"][0, ...].permute(1, 2, 0).detach().cpu())
+                plt.show()
+
                 losses = criterion(images, render_pkg["rgb"])
                 losses["total"].backward()
                 densifier.step(global_step, 
@@ -179,9 +191,11 @@ def train3D(cfg: Training3DConfig):
                                 opacities=neural_gs.opacities)
                 pc.optimizer.step()
                 pc.optimizer.zero_grad()
-                wandb.log({k: v.item() 
-                        for (k, v) in losses.items()}, 
-                        step=global_step)
+                print(global_step, losses["total"])
+                if wandb.run is not None:
+                    wandb.log({k: v.item() 
+                            for (k, v) in losses.items()}, 
+                            step=global_step)
     except KeyboardInterrupt:
         _save_weights(pc)
         wandb.finish()
@@ -212,19 +226,19 @@ def train(cfg: str | Union[Training3DConfig]):
     
 if __name__ == "__main__":
     # create_config(trainer="3D")
-    # cfg = Training3DConfig.from_yaml("config_3D.yaml")
-    # print(cfg.trainer)
-    # train(cfg)
+    cfg = Training3DConfig.from_yaml("config_3D.yaml")
+    print(cfg.trainer)
+    train(cfg)
 
-    from ..scene.visualize import visualize
-    pc = GsModule.load_from_checkpoint("/home/ramzan/Desktop/projects/pddm4D/test_training/training.ckpt")
-    gs = pc.generate_splats()
-    gs.xyz *= 1e+2
-    for attrib in fields(gs):
-        name = attrib.name
-        values = getattr(gs, name)
-        print(name, values.min(), values.mean(), values.max(), values.shape)
+    # from ..scene.visualize import visualize
+    # pc = GsModule.load_from_checkpoint("/home/ramzan/Desktop/projects/pddm4D/test_training/training.ckpt")
+    # gs = pc.generate_splats()
+    # gs.xyz *= 1e+2
+    # for attrib in fields(gs):
+    #     name = attrib.name
+    #     values = getattr(gs, name)
+    #     print(name, values.min(), values.mean(), values.max(), values.shape)
 
-    visualize(gs, cmap="turbo")
+    # visualize(gs, cmap="turbo")
 
     

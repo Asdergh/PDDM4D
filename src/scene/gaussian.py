@@ -8,7 +8,7 @@ import os
 from inspect import signature
 from functools import cached_property
 from torchtyping import TensorType
-from typing import (Optional, Any, Tuple, List)
+from typing import (Optional, Any, Tuple, List, Dict)
 from torch.optim import Adam, SGD
 from dataclasses import (dataclass, field)
 from incremental_pca_torch import IncrementalPCA
@@ -69,6 +69,10 @@ class GsModelOutput:
         return self.xyz.shape[0]
 
 
+def _normalize(x: th.Tensor, a: float, b: float):
+    return a + (((x - x.min()) * (b - a)) \
+                / (x.max() - x.max()))
+
 @dataclass
 class GsModelConfig:
     feat_dim:                   int=32
@@ -99,14 +103,17 @@ class GsModelConfig:
     device:                     str="cuda"
     raster_width:               int=224
     raster_height:              int=224
+    heads_drop_rate:            float=0.23
 
     
 class GsModule(nn.Module):
-    attributes: List[str] = ["feats", 
-                            "anchors", 
-                            "offsets", "opacities",
-                            "colors", "scales",
-                            "rotations"]
+    attributes: Dict[str, int] = {"feats":      (None, None),
+                                "anchors":      (3, None),
+                                "offsets":      (None, None),
+                                "opacities":    (1, "sigmoid"),
+                                "colors":       (3, "sigmoid"),
+                                "scales":       (3, "softplus"),
+                                "rotations":    (4, "tanh")}
     def __init__(self, config: GsModelConfig=None, device: str="cuda"):
         super(GsModule, self).__init__()
         self.cfg = config
@@ -123,22 +130,32 @@ class GsModule(nn.Module):
     def _make_learnable(self, x: th.Tensor):
         """convert simple th.Tensor into learnable param"""
         return nn.Parameter(x.to(self.device).requires_grad_(True))
-    
+
+    def _get_activation(sefl, name: str):
+        "get activation function for mlp_head"
+        _act_cls__ = dict(sigmoid=nn.Sigmoid,
+                            tanh=nn.Tanh,
+                            softmax=nn.Softmax,
+                            softplus=nn.Softplus,
+                            relu=nn.ReLU,
+                            gelu=nn.GELU)[name]
+        return _act_cls__(dim=-1) if name == "softmax" else _act_cls__() 
+        
     def _configure_heads(self):
         """Anchor features projection head 
         initialization function."""
-        for (head, channels, normalize) in (("scales",       3, False), 
-                                            ("opacities",   1, True), 
-                                            ("colors",      3, True), 
-                                            ("rotations",   4, False)):
-            dims = self.cfg.feat_dim + channels
-            dims = (dims if not self.cfg.mlp_use_norms else dims + self.cfg.offsets_n)
-            dims = (dims if not self.cfg.mlp_use_pca_projections else dims + self.cfg.offsets_n * 3)
-            module = nn.Sequential(nn.Linear(dims, self.cfg.offsets_n*channels),
-                                    (nn.Identity() if not normalize else nn.LayerNorm(self.cfg.offsets_n*channels)),
-                                    (nn.Sigmoid() if head in ["opacities", "colors"] else nn.Identity()),
-                                    (nn.Softplus() if head == "scales" else nn.Identity())).to(self.device)
-            setattr(self, f"_mlp_{head}", module)
+        for attrib, info in self.attributes.items():
+            if attrib not in ["feats", "offsets", "anchors"]:
+                dim = info[0]                                      \
+                    + (self.cfg.mlp_use_norms)*self.cfg.offsets_n   \
+                    + (self.cfg.mlp_use_pca_projections) * self.cfg.offsets_n
+                setattr(self, f"_mlp_{attrib}", nn.Sequential(nn.Linear(
+                    self.cfg.feat_dim, 
+                    self.cfg.offsets_n*dim
+                ),
+                    nn.LayerNorm(self.cfg.offsets_n*dim),
+                    nn.Dropout(p=self.cfg.heads_drop_rate),
+                    self._get_activation(info[1])).to(self.device))
 
     def _configure_optimizer(self):
         """Optimizer Configuration."""
@@ -146,7 +163,7 @@ class GsModule(nn.Module):
             {"params": getattr(self, f"_{attrib}"), 
             "name": attrib,
             "lr": getattr(self.cfg, f"{attrib}_lr")}
-            for attrib in self.attributes
+            for attrib in ["feats", "anchors", "offsets"]
         ] + [
             {"params": getattr(self, f"_mlp_{attrib}").parameters(),
             "name": f"mlp_{attrib}",
@@ -229,15 +246,10 @@ class GsModule(nn.Module):
         dists = self.get_scene_dists(xyz, mode="min", return_tensors="pt")
         self.set_scale_bounds(dists["min_dist"], dists["max_dist"])
         self.scene_scale = self.get_scene_diag(xyz)
-        print(self.scale_bounds)
         
         self._feats = self._make_learnable(th.zeros(n, self.cfg.feat_dim))
         self._anchors = self._make_learnable(xyz)
         self._offsets = self._make_learnable(th.zeros(n, self.cfg.offsets_n, 3))
-        self._scales = self._make_learnable(th.log(dists["ani_dists"] + 1e-2))
-        self._rotations = self._make_learnable(th.normal(0, 1, (n, 4)))
-        self._colors = self._make_learnable(rgb)
-        self._opacities = self._make_learnable(th.zeros(n, 1))
         
         self._configure_heads()
         self._configure_optimizer()
@@ -255,69 +267,80 @@ class GsModule(nn.Module):
         model to be more independet of viewpoints and become 
         more geometricaly sastainable"""
 
-        features = self._feats
-        anchors = self._anchors
+        features = self._feats.clone()
+        anchors = self._anchors.clone()
         xyz = anchors.view(-1, 1, 3) + self._offsets
         dirs = xyz - anchors.view(-1, 1, 3)
         dirs = (dirs / th.linalg.norm(dirs, dim=-1, keepdims=True))
 
-        dirs_feats = None
-        if self.cfg.mlp_use_norms:
-            dirs_feats = th.linalg.norm(dirs, dim=-1)
-        if self.cfg.mlp_use_pca_projections:
-            ipca = IncrementalPCA(n_components=3,
-                                    batch_size=256,
-                                    device=features.device)
-            ipca.fit(features)
-            features_pca = ipca.transform(features)
-            features_pca = (features_pca.view(-1, 1, 3) * self._offsets).sum(dim=-1)
-            dirs_feats = (dirs_feats if dirs_feats is not None else features)
-            dirs_feats = th.cat([dirs_feats, features_pca], dim=-1)
+        def _add_features(features: th.Tensor):
+            """add dir normals and pca projections to anchor features"""
+            add_features = features.clone()
+            if self.cfg.mlp_use_norms:
+                norms = th.linalg.norm(dirs, dim=-1)
+                add_features = th.cat([add_features, norms], dim=-1)
+            if self.cfg.mlp_use_pca_projections:
+                ipca = IncrementalPCA(n_components=3,
+                                        batch_size=256,
+                                        device=features.device)
+                ipca.fit(features)
+                features_pca = ipca.transform(features)
+                pca_projections = (features_pca.view(-1, 1, 3) * self._offsets).sum(dim=-1)
+                add_features = th.cat([add_features, pca_projections], dim=-1)
+            return add_features
 
-        def _builds_features(name, feats, dirs_feats=None):
-            if dirs_feats is None:
-                return th.cat([feats, 
-                                getattr(self, f"_{name}")], 
-                                dim=-1)
-            else:
-                return th.cat([feats, 
-                                getattr(self, f"_{name}"),
-                                dirs_feats], dim=-1)
-            
-        project_features = lambda name: \
-                        getattr(self, f"_mlp_{name}")(_builds_features(name, features, dirs_feats))
+        features = _add_features(features)
         attributes = dict(xyz=xyz.view(-1, 3), **{
-            name: project_features(name).view(-1, channels)
-            for (name, channels) in [("colors",     3), 
-                                    ("opacities",   1), 
-                                    ("scales",      3),
-                                    ("rotations",   4)]
+            attrib: getattr(self, f"_mlp_{attrib}")(features).view(-1, info[0])
+            for attrib, info in self.attributes.items()
+            if attrib not in ["feats", "anchors", "offsets"]
         })
-        attributes["scales"] = th.exp(th.clamp(attributes["scales"], 
-                                                min=self.scale_bounds["min_log"],
-                                                max=self.scale_bounds["max_log"]))
+        attributes["scales"] = th.exp(_normalize(attributes["scales"],
+                                                a=self.scale_bounds["min_log"],
+                                                b=self.scale_bounds["max_log"]))
         return GsModelOutput(**attributes)
 
     def read_ply(self, path: str):
         """Anchor Gs format ply file reader"""
         if os.path.exists(path):
             data = PlyData.read(path)["vertex"]
-            for attrib in self.attributes:
-                values = list(data[p.name] 
-                        for p in data.properties 
-                        if attrib in p.name)
-                if isinstance(values[0], np.ndarray):
-                    values = np.stack(values, axis=-1)
-                    values = th.from_numpy(values).float()
-                elif isinstance(values[0], th.Tensor):
-                    values = th.stack(values, dim=-1)
-                else:
-                    raise ValueError(f"unknow type for {attrib}: {type(values[0])}")
-                if attrib == "offsets":
-                    values = values.view(-1, self.cfg.offsets_n, 3)
-                setattr(self, f"_{attrib}", self._make_learnable(values))
+            self._anchors = self._make_learnable(
+                th.from_numpy(np.stack(
+                    [
+                        data["x"], 
+                        data["y"],
+                        data["z"]
+                    ], axis=-1
+                )).float()
+            )
 
-            scale_params = self.get_scene_dists(self._anchors)
+            print([p.name for p in data.properties])
+            feats = th.from_numpy(
+                np.stack([data[p.name] 
+                        for p in data.properties 
+                        if "anchor_feats" in p.name], 
+                        axis=-1)
+            ).float()
+            print(feats.shape)
+            assert feats.shape[-1] == self.cfg.feat_dim, \
+            ("wrong ply content format for current model configuration. \n"
+            f"Current {self.cfg.feat_dim=} != loaded feat_dim:={feats.shape[1]}.")
+            self._feats = self._make_learnable(feats)
+
+            offsets = th.from_numpy(
+                np.stack([data[p.name]
+                        for p in data.properties
+                        if "anchor_offsets" in p.name],
+                        axis=-1)
+            ).float()
+            assert offsets.shape[-1] == self.cfg.offsets_n*3, \
+            ("wrong ply content format for current model configuration. \n"
+            f"Current {self.cfg.offsets_n=} != loaded offsets_dim:={offsets.shape[1]}.")
+            self._offsets = self._make_learnable(offsets.view(-1, self.cfg.offsets_n, 3))
+
+            xyz = self._anchors.clone()
+            self.scene_scale = self.get_scene_diag(xyz)
+            scale_params = self.get_scene_dists(xyz)
             self.set_scale_bounds(a=scale_params["min_dist"], 
                                     b=scale_params["max_dist"])
             self._configure_heads()
@@ -325,27 +348,31 @@ class GsModule(nn.Module):
 
     def write_ply(self, path: str):
         """Anchor Gs format ply file writer"""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        elements = dict()
-        for attrib in self.attributes:
-            if attrib != "offsets":
-                values = getattr(self, f"_{attrib}")
-                types = list((f"{attrib}_{i}", "f4") for i in range(values.shape[-1]))
-                values = values.unbind(dim=1)
-            else:
-                values = getattr(self, f"_{attrib}")
-                types = list((f"{attrib}_{i}_{j}", "f4")
-                                for i in range(values.shape[1])
-                                for j in range(values.shape[-1]))
-                values = values.view(-1, 3*self.cfg.offsets_n).unbind(dim=-1)
-            elements.update(dict(zip(types, values)))
+        if not hasattr(self, "_anchors"):
+            raise RuntimeError("can not write empty GsModule into ply file")
+        else:
+            n = self._anchors.shape[0]
+            feats_dtypes = list((f"anchor_feats_{i}", "f4") for i in range(self._feats.shape[0]))
+            feats_values = self._feats.clone().unbind(dim=-1)
+            feats_elements = dict(zip(feats_dtypes, feats_values))
 
-        e = np.empty((self._anchors.shape[0],), dtype=list(elements.keys()))
-        for (key, values) in elements.items():
-            e[key[0]] = values.detach().cpu().numpy()
-        e = PlyElement.describe(e, "vertex")
-        PlyData([e], text=True).write(path)
+            offsets_dtypes = list((f"anchor_offsets_{i}_{j}", "f4") 
+                                    for i in range(self.cfg.offsets_n)
+                                    for j in range(3))
+            offsets_values = self._offsets.clone().view(n, -1).unbind(dim=-1)
+            offsets_elements = dict(zip(offsets_dtypes, offsets_values))
 
+            anchors_dtypes = [("x", "f4"), ("y", "f4"), ("z", "f4")]
+            anchors_values = self._anchors.clone().unbind(dim=-1)
+            anchors_elements = dict(zip(anchors_dtypes, anchors_values))
+
+            elements = (anchors_elements | feats_elements | offsets_elements)
+            e = np.empty((n, ), dtype=list(elements.keys()))
+            for (key, values) in elements.items():
+                e[key[0]] = values.detach().cpu().numpy()
+
+            e = PlyElement.describe(e, "vertex")
+            PlyData([e]).write(path)
 
     @classmethod
     def load_from_checkpoint(cfg, path: str) -> 'GsModule':
@@ -522,4 +549,5 @@ class AnchorGrowing:
                 self._opacity_accumulator *= 0
                 self._gradient_accumulator *= 0
                 if self.logg is not None:
+                    print(self.pc._anchors.shape[0])
                     self.logger.info(f"Points after densification: {self.pc._anchors.shape[0]}")
