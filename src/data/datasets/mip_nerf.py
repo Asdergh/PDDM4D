@@ -8,7 +8,7 @@ from functools import cached_property
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
 from kornia.geometry.conversions import quaternion_to_rotation_matrix
-from typing import (Optional, Literal, Dict, Any)
+from typing import (Optional, Literal, Dict, Any, Tuple)
 from torch.utils.data import Dataset
 from nerfstudio.data.utils.colmap_parsing_utils import (read_cameras_binary,
                                                         read_points3D_binary,
@@ -31,6 +31,7 @@ class MipNerf360v2DatasetConfig:
     resolution_type: int=0
     max_views: Optional[int]=None
     random_views: bool=False
+    target_resolution: Optional[Tuple[int] | int]=None
 
 @register_dataset("360v2", MipNerf360v2DatasetConfig)
 class MipNerf360v2Dataset(Dataset):
@@ -56,22 +57,25 @@ class MipNerf360v2Dataset(Dataset):
         self.transform: callable = None
         self._read_data()
 
-    @property
-    def image_transoform(self):
-        return self.trnasform
+    def set_img_transforms(self, transforms: callable):
+        """setup image transforms function. """
+        self.transform = transforms
 
-    @image_transoform.setter
-    def image_transform(self, transform: callable):
-        self.transform = transform
-
-    def _get_factor(self, size: tuple):
-        new_size = (size[0] / self._res_factors[self.config.resolution_type], 
-                    size[1] / self._res_factors[self.config.resolution_type])
-        return {"sx": new_size[0] / size[0], 
-                "sy": new_size[1] / size[1]}
+    def _rescale_intrinsics(self, 
+                            K: th.Tensor, 
+                            sx: float=1.0, 
+                            sy: float=1.0):
+        """rescale intrinsics matrix for neww image size. """
+        new_K = K.clone()
+        new_K[1, 1] *= sx
+        new_K[1, 2] *= sx
+        new_K[0, 0] *= sy
+        new_K[0, 2] *= sy
+        return new_K
 
     @cached_property
     def sparse(self):
+        """cached property to get sparse data from dataset i.e: xyz, rgb. """
         pts3D = read_points3D_binary(os.path.join(self.sparse_data, "0/points3D.bin"))
         print(len(pts3D))
         (xyz, rgb) = [], []
@@ -84,15 +88,29 @@ class MipNerf360v2Dataset(Dataset):
         return {"xyz": th.Tensor(xyz), "rgb": rgb}
 
     def _read_data(self):
+        """main data rading function. """
+        def _set_target_resolution(imagef: str):
+            """original image size handling from MipNerf360v2. """
+            if not hasattr(self, "img_size"):
+                image = to_tensor(Image.open(imagef))
+                image_size = list(image.shape[-2:]
+                                if image.ndim == 3
+                                else image.shape)
+                
+                self.img_size = (np.asarray(image_size) \
+                / self._res_factors[self.config.resolution_type])\
+                .tolist()
+                self.cam2img_scale = np.asarray(self.img_size) / np.asarray(image_size)
+                
         self.intrinsics: Dict[int, Any] = read_cameras_binary(os.path.join(self.sparse_data, "0/cameras.bin"))
         images_info: Dict[int, Any] = read_images_binary(os.path.join(self.sparse_data, "0/images.bin"))
 
         max_views = min(self.config.max_views, len(images_info))   \
-                        if self.config.max_views is not None       \
+                        if self.config.max_views is not None        \
                         else len(images_info)
         view_indices = list(images_info.keys())
         view_indices = rd.sample(view_indices, max_views)          \
-                        if self.config.random_views                \
+                        if self.config.random_views                 \
                         else view_indices[:max_views]
 
         self.samples = []
@@ -100,15 +118,16 @@ class MipNerf360v2Dataset(Dataset):
         for view_id in tqdm(view_indices, desc="Loading 360v2..."):
             sample = images_info[view_id]
             imagef = os.path.join(self.images_folder, sample.name)
+            _set_target_resolution(imagef)
 
             camera = self.intrinsics[sample.camera_id]
-            scale = self._get_factor((camera.width, camera.height))
             params = th.from_numpy(camera.params).float()
             K = th.eye(3)
-            K[0, 0] = scale["sx"]*params[0]
-            K[0, 2] = scale["sx"]*params[2]
-            K[1, 1] = scale["sy"]*params[1]
-            K[1, 2] = scale["sy"]*params[3]
+            K[1, 1] = params[0]
+            K[1, 2] = params[2]
+            K[0, 0] = params[1]
+            K[0, 2] = params[3]
+            K = self._rescale_intrinsics(K, *self.cam2img_scale.tolist())
 
             Twc = Tcw = th.eye(4)
             t = th.from_numpy(sample.tvec).float()
@@ -124,8 +143,8 @@ class MipNerf360v2Dataset(Dataset):
                             viewmat_c2w=Tcw)
             self.samples.append(sample)
         self.pts3D_indices = np.unique(np.concatenate(self.pts3D_indices))\
-        .astype(np.int32)\
-        .tolist()
+            .astype(np.int32)\
+            .tolist()
 
     def __len__(self):
         return len(self.samples)
@@ -134,8 +153,15 @@ class MipNerf360v2Dataset(Dataset):
         if idx >= len(self):
             raise IndexError(f"{idx=} is out range for dataset lenght")
         image = to_tensor(Image.open(self.samples[idx]["image"]))
-        image = image                       \
-                if self.transform is None   \
+        image = image                           \
+                if self.transform is None        \
                 else self.transform(image)
-        return {**self.samples[idx], "image": image}
+        K = self.samples[idx]["intrinsics"].clone()
+        if image.shape[-2:] != self.img_size:
+            scales = np.asarray(image.shape[-2:]) \
+                    / np.asarray(self.img_size)
+            K = self._rescale_intrinsics(K, *scales)
+        return {**self.samples[idx], 
+                "image": image, 
+                "intrinsics": K}
 

@@ -52,7 +52,7 @@ class GsModelOutput:
             # if name == "scales":
                 # values *= 1e+1
             attributes[name] = values.cpu().detach().numpy()
-            print(name, values.min(), values.mean(), values.max())
+            # print(name, values.min(), values.mean(), values.max())
         return GsModelOutput(**attributes)
 
     def downsample(self, size: int=10):
@@ -71,7 +71,7 @@ class GsModelOutput:
 
 def _normalize(x: th.Tensor, a: float, b: float):
     return a + (((x - x.min()) * (b - a)) \
-                / (x.max() - x.max()))
+                / (x.max() - x.min() + 1e-6))
 
 @dataclass
 class GsModelConfig:
@@ -92,7 +92,7 @@ class GsModelConfig:
     mlp_rotations_lr:           float=0.01
     opacity_trashold:           float=0.01
     densify_from:               int=100
-    density_every:              int=100
+    densify_every:              int=100
     densify_until:              int=3000
     opacity_trashold:           float=0.01
     xyz_gradient_trashold:      float=0.01
@@ -105,9 +105,8 @@ class GsModelConfig:
     raster_height:              int=224
     heads_drop_rate:            float=0.23
 
-    
 class GsModule(nn.Module):
-    attributes: Dict[str, int] = {"feats":      (None, None),
+    attributes: Dict[str, Tuple[Any]] = {"feats":      (None, None),
                                 "anchors":      (3, None),
                                 "offsets":      (None, None),
                                 "opacities":    (1, "sigmoid"),
@@ -132,7 +131,7 @@ class GsModule(nn.Module):
         return nn.Parameter(x.to(self.device).requires_grad_(True))
 
     def _get_activation(sefl, name: str):
-        "get activation function for mlp_head"
+        """get activation function for mlp_head"""
         _act_cls__ = dict(sigmoid=nn.Sigmoid,
                             tanh=nn.Tanh,
                             softmax=nn.Softmax,
@@ -247,7 +246,7 @@ class GsModule(nn.Module):
         self.set_scale_bounds(dists["min_dist"], dists["max_dist"])
         self.scene_scale = self.get_scene_diag(xyz)
         
-        self._feats = self._make_learnable(th.zeros(n, self.cfg.feat_dim))
+        self._feats = self._make_learnable(th.normal(0, 1, (n, self.cfg.feat_dim)))
         self._anchors = self._make_learnable(xyz)
         self._offsets = self._make_learnable(th.zeros(n, self.cfg.offsets_n, 3))
         
@@ -269,9 +268,10 @@ class GsModule(nn.Module):
 
         features = self._feats.clone()
         anchors = self._anchors.clone()
-        xyz = anchors.view(-1, 1, 3) + self._offsets
+        delta_xyz = self._offsets.clone()
+        xyz = anchors.view(-1, 1, 3) + delta_xyz
         dirs = xyz - anchors.view(-1, 1, 3)
-        dirs = (dirs / th.linalg.norm(dirs, dim=-1, keepdims=True))
+        dirs = (dirs / (th.linalg.norm(dirs, dim=-1, keepdims=True) + 1e-6))
 
         def _add_features(features: th.Tensor):
             """add dir normals and pca projections to anchor features"""
@@ -285,7 +285,7 @@ class GsModule(nn.Module):
                                         device=features.device)
                 ipca.fit(features)
                 features_pca = ipca.transform(features)
-                pca_projections = (features_pca.view(-1, 1, 3) * self._offsets).sum(dim=-1)
+                pca_projections = (features_pca.view(-1, 1, 3) * delta_xyz).sum(dim=-1)
                 add_features = th.cat([add_features, pca_projections], dim=-1)
             return add_features
 
@@ -298,6 +298,12 @@ class GsModule(nn.Module):
         attributes["scales"] = th.exp(_normalize(attributes["scales"],
                                                 a=self.scale_bounds["min_log"],
                                                 b=self.scale_bounds["max_log"]))
+        for (k, values) in attributes.items():
+            if attributes[k] is not None:
+                print(k, values.min().item(), 
+                    values.mean().item(), 
+                    values.max().item(), 
+                    values.shape)
         return GsModelOutput(**attributes)
 
     def read_ply(self, path: str):
@@ -382,7 +388,7 @@ class GsModule(nn.Module):
             cfg = GsModelConfig(**ckpt["hyperparams"])
             pc = GsModule(cfg, device="cpu")
 
-            pc.read_ply(ckpt["sparse_states"])
+            # pc.read_ply(ckpt["sparse_states"])
             pc.load_state_dict(ckpt["gaussian_heads"])
             pc.optimizer.load_state_dict(ckpt["optimizer_states"])
             return pc
@@ -412,8 +418,7 @@ class GsModule(nn.Module):
             near_plane=far_near[0],
             far_plane=far_near[1],
             width=self.cfg.raster_width,
-            height=self.cfg.raster_height,
-            
+            height=self.cfg.raster_height
         )
         return dict(rgb=render_rgb.permute(0, 3, 1, 2),
                     alpha=render_alpha.permute(0, 3, 1, 2),

@@ -11,6 +11,7 @@ def register_dataset(name: str, config):
     return decorator
 
 def get_dataset(source: str | object, **kwargs):
+    print(source, type(source))
     if isinstance(source, str):
         info = __DATASETS__[source]
         valid_kwargs = dict()
@@ -19,12 +20,16 @@ def get_dataset(source: str | object, **kwargs):
             if name in kwargs:
                 valid_kwargs[name] = kwargs[name]
         return info["cls"](info["config"](**valid_kwargs))
-    
-    elif hasattr(source, "name"):
+    elif isinstance(source, dict) \
+        and ("name" in source):
+        name = source["name"]
+        assert name in __DATASETS__
+        info = __DATASETS__[name]
+        return info["cls"](config=info["config"](**source))
+    elif is_dataclass(source):
         name = getattr(source, "name")
         assert name in __DATASETS__
         info = __DATASETS__[name]
-        if isinstance(source, info["config"]):
-            return info["cls"](source)
+        return info["cls"](source)
     else:
         raise ValueError(f"unknown type or dataset: {source}")

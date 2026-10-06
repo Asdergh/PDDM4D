@@ -27,7 +27,6 @@ class CombinedVisualLossConfig:
     init_l2_weight: float = 1.0
     init_perceptual_weight: float = 1.0
     requires_grad: bool = True
-    perceptual_weights: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         """Compute derived SSIM constants."""
@@ -106,14 +105,10 @@ class CombinedVisualLoss(nn.Module):
             torch.tensor(cfg.perceptual_std).view(1, 3, 1, 1)
         )
         self.perceptual_use_l1 = cfg.perceptual_use_l1
-
-        if cfg.perceptual_weights is not None:
-            self.register_buffer('per_layer_weights', cfg.perceptual_weights)
-        else:
-            self.register_buffer(
-                'per_layer_weights',
-                torch.ones(len(self.perceptual_layers))
-            )
+        self.register_buffer(
+            'per_layer_weights',
+            torch.ones(len(self.perceptual_layers))
+        )
 
     def _ssim_map(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Compute SSIM map for each pixel."""
